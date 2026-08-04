@@ -1,0 +1,111 @@
+name: Build & Release ARGoS (Linux)
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - '*.*.*-*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build/release (format X.Y.Z-release, e.g. 3.0.0-beta1)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-22.04
+          - arch: arm64
+            os: ubuntu-22.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential pkg-config \
+            libfreeimage-dev libfreeimageplus-dev \
+            qt6-base-dev qt6-base-dev-tools libqt6opengl6-dev \
+            libgl1-mesa-dev libglu1-mesa-dev \
+            freeglut3-dev libxi-dev libxmu-dev \
+            liblua5.3-dev lua5.3 \
+            doxygen graphviz libgraphviz-dev asciidoc \
+            rpm
+
+      - name: Configure
+        run: cmake -S src -B build_simulator -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DARGOS_DOCUMENTATION=ON
+
+      - name: Build
+        run: cmake --build build_simulator --parallel "$(nproc)"
+
+      - name: Run tests
+        working-directory: build_simulator
+        run: ctest --output-on-failure -C ${{ env.BUILD_TYPE }}
+
+      - name: Build documentation
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        working-directory: build_simulator
+        run: make doc
+
+      - name: Package
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        working-directory: build_simulator
+        run: sudo cpack -G "DEB;RPM;TGZ"
+
+      - name: Upload package artifacts
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: argos3-packages-${{ matrix.arch }}
+          path: |
+            build_simulator/*.deb
+            build_simulator/*.rpm
+            build_simulator/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: echo "name=${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: packages
+          pattern: argos3-packages-*
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ARGoS ${{ steps.tag.outputs.name }}
+          files: packages/*
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
